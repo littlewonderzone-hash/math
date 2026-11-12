@@ -1,0 +1,1796 @@
+/**
+ * গণিত অলিম্পিয়াড (প্রস্তুতি কোর্স) — Google Apps Script ব্যাকএন্ড
+ * ---------------------------------------------------------
+ * এই কোডটি Google Sheet-কে ডাটাবেস হিসেবে ব্যবহার করে একটা API সার্ভার
+ * তৈরি করে। কোনো ম্যানুয়াল হেডার লেখা বা Sheet ID কপি করার দরকার নেই —
+ * নিচের setup() ফাংশনটা একবার Run করলেই সব ট্যাব, হেডার, ডিফল্ট
+ * অ্যাডমিন — সব নিজে থেকে তৈরি হয়ে যাবে। আগে থেকে ডেটা থাকলে setup()
+ * আবার Run করলেও পুরনো কোনো ডেটা মোছে না — শুধু নতুন কলাম/ট্যাব যোগ হয়।
+ *
+ * সেটআপ নির্দেশনা README_BN.md ফাইলে দেখুন।
+ */
+
+const DEFAULT_ADMIN_USERNAME = "admin";
+const DEFAULT_ADMIN_PASSWORD = "matholympiad2026"; // ডিপ্লয়ের পর এটা অবশ্যই বদলান
+
+// প্রতিটা তালিকায় নতুন ফিল্ড সবসময় শেষে যোগ করা হয় — যাতে আগে থেকে থাকা
+// শিটের কোনো কলাম এলোমেলো না হয়ে যায়, পুরনো ডেটা অক্ষত থাকে।
+const REGISTRATION_HEADERS = [
+  "id", "name", "className", "school", "division", "phone", "email",
+  "password", "bkashSender", "transactionId", "status", "note", "createdAt",
+  "studentToken", "tier",
+];
+
+const NOTICE_HEADERS = ["id", "message", "active", "createdAt"];
+
+const CONTACT_HEADERS = ["id", "email", "phone", "message", "status", "createdAt"];
+
+const WRITTEN_QUESTION_HEADERS = [
+  "id", "passageHtml", "questionsJson", "kind", "status",
+  "forMock", "forLive", "createdAt", "passageImageUrl", "liveExamId",
+  "testNo", "minutes",
+  "topics", "solutionHtml", "solutionImageUrl", "publishAt",
+];
+
+// একাধিক লাইভ পরীক্ষা — প্রতিটার নিজস্ব নাম, শুরু/শেষের উইন্ডো (ISO সময়) ও পরীক্ষার সময়কাল (মিনিট)
+const LIVE_EXAM_HEADERS = ["id", "title", "start", "end", "minutes", "createdAt"];
+
+const WRITTEN_ATTEMPT_HEADERS = [
+  "id", "registrationId", "phone", "email", "examType", "kind", "sessionId",
+  "writtenQuestionId", "subQuestionId", "subQuestionText", "points", "imageUrl",
+  "status", "score", "annotatedImageUrl", "adminComment", "createdAt", "gradedAt",
+  "subQuestionImageUrl", "liveExamId",
+];
+
+const BENGALI_ORDINALS = [
+  "প্রথম", "দ্বিতীয়", "তৃতীয়", "চতুর্থ", "পঞ্চম", "ষষ্ঠ", "সপ্তম", "অষ্টম",
+  "নবম", "দশম", "একাদশ", "দ্বাদশ", ,
+];
+
+function ordinalBn_(n) {
+  return BENGALI_ORDINALS[n - 1] || n + "তম";
+}
+
+/**
+ * এই একটামাত্র ফাংশন Run করলে দরকারি সব শিট/ট্যাব, হেডার, ডিফল্ট সেটিংস
+ * এবং একটা ডিফল্ট অ্যাডমিন — সব অটোমেটিক তৈরি হয়ে যাবে। আগে একবার Run করা
+ * থাকলেও আবার Run করা নিরাপদ — নতুন আপডেটে যোগ হওয়া কলাম/ট্যাব শুধু যোগ হবে,
+ * পুরনো কোনো সারি/মান মোছা হবে না।
+ */
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let regSheet = ss.getSheetByName("Registrations");
+  if (!regSheet) regSheet = ss.insertSheet("Registrations");
+  ensureHeaders_(regSheet, REGISTRATION_HEADERS);
+  forceTextColumn_(regSheet, REGISTRATION_HEADERS.indexOf("phone") + 1);
+  forceTextColumn_(regSheet, REGISTRATION_HEADERS.indexOf("bkashSender") + 1);
+  forceTextColumn_(regSheet, REGISTRATION_HEADERS.indexOf("transactionId") + 1);
+
+  let settingsSheet = ss.getSheetByName("Settings");
+  if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
+  if (settingsSheet.getLastRow() === 0) {
+    settingsSheet.appendRow(["key", "value"]);
+    settingsSheet.appendRow(["price", "99"]);
+    settingsSheet.appendRow(["discountDeadline", ""]);
+    settingsSheet.appendRow(["courseImageUrl", ""]);
+    settingsSheet.appendRow(["maintenanceMode", "FALSE"]);
+    settingsSheet.appendRow(["writtenMinutes", "25"]);
+    settingsSheet.appendRow(["siteUrl", ""]);
+    settingsSheet.appendRow(["logoUrl", ""]);
+    settingsSheet.setFrozenRows(1);
+  } else {
+    ensureSettingsKeys_(settingsSheet, [
+      "writtenMinutes", "siteUrl", "logoUrl",
+    ]);
+  }
+
+  let adminsSheet = ss.getSheetByName("Admins");
+  if (!adminsSheet) adminsSheet = ss.insertSheet("Admins");
+  if (adminsSheet.getLastRow() === 0) {
+    adminsSheet.appendRow(["username", "password", "token"]);
+    adminsSheet.appendRow([DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, ""]);
+    adminsSheet.setFrozenRows(1);
+  }
+
+  let noticesSheet = ss.getSheetByName("Notices");
+  if (!noticesSheet) noticesSheet = ss.insertSheet("Notices");
+  ensureHeaders_(noticesSheet, NOTICE_HEADERS);
+
+  let contactsSheet = ss.getSheetByName("Contacts");
+  if (!contactsSheet) contactsSheet = ss.insertSheet("Contacts");
+  ensureHeaders_(contactsSheet, CONTACT_HEADERS);
+
+  let writtenQSheet = ss.getSheetByName("WrittenQuestions");
+  if (!writtenQSheet) writtenQSheet = ss.insertSheet("WrittenQuestions");
+  ensureHeaders_(writtenQSheet, WRITTEN_QUESTION_HEADERS);
+  ensureModelNumbers_(); // আগের প্রশ্নগুলো স্বয়ংক্রিয়ভাবে Model Test হয়ে যায়
+
+  let liveSheet = ss.getSheetByName("LiveExams");
+  if (!liveSheet) liveSheet = ss.insertSheet("LiveExams");
+  ensureHeaders_(liveSheet, LIVE_EXAM_HEADERS);
+
+  let writtenASheet = ss.getSheetByName("WrittenAttempts");
+  if (!writtenASheet) writtenASheet = ss.insertSheet("WrittenAttempts");
+  ensureHeaders_(writtenASheet, WRITTEN_ATTEMPT_HEADERS);
+
+  const blank = ss.getSheetByName("Sheet1");
+  if (blank && ss.getSheets().length > 1) ss.deleteSheet(blank);
+
+  Logger.log("সেটআপ সম্পন্ন! এখন Deploy → New deployment (বা Manage deployments → New version) করুন।");
+  Logger.log("অ্যাডমিন লগইন — username: " + DEFAULT_ADMIN_USERNAME + " | password: " + DEFAULT_ADMIN_PASSWORD);
+  installTriggers_(); // দৈনিক ব্যাকআপ ও লাইভ রিমাইন্ডার
+}
+
+/** কোনো শিটে হেডার না থাকলে বসিয়ে দেয়; থাকলে যা যা নতুন কলাম বাকি আছে সেগুলো
+ *  শেষে যোগ করে দেয় — পুরনো কোনো ডেটা/কলামের অবস্থান বদলায় না। */
+function ensureHeaders_(sheet, headers) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    sheet.setFrozenRows(1);
+    return;
+  }
+  const existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  headers.forEach((h) => {
+    if (existing.indexOf(h) === -1) {
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue(h);
+      existing.push(h);
+    }
+  });
+}
+
+/**
+ * নতুন সারি যোগ করার সময় ডেটা সবসময় হেডারের *আসল নাম* দেখে সঠিক কলামে বসায় —
+ * কোনো কলামের অবস্থান কোডে যেভাবে লেখা আছে সেই অনুমানের উপর নির্ভর করে না।
+ *
+ * কেন এটা জরুরিঃ ensureHeaders_() নতুন কলাম সবসময় শিটের *শেষে* যোগ করে, কিন্তু
+ * কোডের হেডার-তালিকায় (যেমন WRITTEN_ATTEMPT_HEADERS) নতুন ফিল্ড মাঝখানে যোগ
+ * হলে (যেমন "kind" আগে "sessionId"-এর ঠিক আগে বসানো হয়েছিল, শেষে না), তখন
+ * appendRow([...fixed order...]) ভুল কলামে ডেটা বসিয়ে দিতে পারে — যেটা
+ * "স্টুডেন্ট এক প্রশ্নের উত্তর দিয়েছে কিন্তু এডমিন প্যানেলে অন্য প্রশ্ন
+ * দেখাচ্ছে" এই বাগের মূল কারণ ছিল। এই ফাংশনটা সবসময় শিটের *বর্তমান* হেডার
+ * সারি পড়ে, নামের সাথে মিলিয়ে বসায় — তাই ভবিষ্যতে হেডার-অর্ডার যেভাবেই
+ * বদলাক না কেন এই সমস্যা আর হবে না।
+ */
+function appendRowByHeaders_(sheet, dataObject) {
+  const headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const row = headerRow.map((h) => (Object.prototype.hasOwnProperty.call(dataObject, h) ? dataObject[h] : ""));
+  sheet.appendRow(row);
+}
+
+/** পুরনো Settings শিটে নতুন কোনো key না থাকলে সেটা খালি মান দিয়ে যোগ করে দেয়। */
+function ensureSettingsKeys_(sheet, keys) {
+  const rows = sheet.getDataRange().getValues();
+  const existing = rows.slice(1).map((r) => r[0]);
+  keys.forEach((k) => {
+    if (existing.indexOf(k) === -1) sheet.appendRow([k, ""]);
+  });
+}
+
+/** একটা কলামের ফরম্যাট "Plain text" করে দেয় যাতে ০১XXXXXXXXX-এর মতো নম্বরের
+ *  শুরুর "0" Google Sheets সংখ্যা ভেবে মুছে না ফেলে। */
+function forceTextColumn_(sheet, colIndex) {
+  if (colIndex < 1) return;
+  sheet.getRange(1, colIndex, Math.max(sheet.getMaxRows(), 1000), 1).setNumberFormat("@");
+}
+
+function getSheet_(name) {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+}
+
+function jsonOut_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
+    ContentService.MimeType.JSON
+  );
+}
+
+function sheetToObjects_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  return values.slice(1).map((row, idx) => {
+    const obj = { _row: idx + 2 };
+    headers.forEach((h, i) => (obj[h] = row[i]));
+    return obj;
+  });
+}
+
+function findRowIndexById_(sheet, id) {
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(id)) return i + 1; // 1-indexed sheet row
+  }
+  return -1;
+}
+
+/** ফোন নম্বর তুলনার জন্য নরমালাইজ করে — Sheets মাঝেমধ্যে শুরুর "0" মুছে ফেলে,
+ *  এই ফাংশনটা সেটা ধরে আবার বসিয়ে দেয় যাতে পুরনো (already-corrupted) সারির
+ *  সাথেও ঠিকভাবে মিলে যায়। */
+function normalizePhone_(v) {
+  let digits = String(v || "").replace(/[^0-9]/g, "");
+  if (digits.length === 10 && digits[0] !== "0") digits = "0" + digits;
+  return digits;
+}
+
+/**
+ * এই ফাংশনটা একবার ম্যানুয়ালি Run করলে Registrations শিটে আগে থেকে যেসব ফোন/বিকাশ
+ * নম্বরের শুরুর "0" হারিয়ে গেছে (Google Sheets সংখ্যা ভেবে ফেলেছিল), সেগুলো খুঁজে বের
+ * করে আবার "0" বসিয়ে ঠিক করে দেয় — শুধুমাত্র ১০-ডিজিটের (０ ছাড়া) নম্বরে প্রযোজ্য।
+ * Apps Script এডিটরে ড্রপডাউন থেকে "fixExistingPhoneNumbers" সিলেক্ট করে ▶ Run করুন।
+ */
+function fixExistingPhoneNumbers() {
+  const sheet = getSheet_("Registrations");
+  forceTextColumn_(sheet, REGISTRATION_HEADERS.indexOf("phone") + 1);
+  forceTextColumn_(sheet, REGISTRATION_HEADERS.indexOf("bkashSender") + 1);
+
+  const phoneCol = REGISTRATION_HEADERS.indexOf("phone") + 1;
+  const bkashCol = REGISTRATION_HEADERS.indexOf("bkashSender") + 1;
+  const lastRow = sheet.getLastRow();
+  let fixedCount = 0;
+
+  for (let row = 2; row <= lastRow; row++) {
+    [phoneCol, bkashCol].forEach((col) => {
+      const cell = sheet.getRange(row, col);
+      const current = String(cell.getValue() || "");
+      const normalized = normalizePhone_(current);
+      if (normalized && normalized !== current) {
+        cell.setValue(normalized);
+        fixedCount++;
+      }
+    });
+  }
+
+  Logger.log("ঠিক করা হয়েছে এমন ঘরের সংখ্যা: " + fixedCount);
+}
+
+/* ---------------- Settings ---------------- */
+
+/* ---- ছোট ক্যাশ (CacheService): সেটিংস ও লাইভ তালিকা বারবার শিট থেকে না পড়ে, বড় লাইভ পরীক্ষায় একসাথে অনেকে ঢুকলে চাপ কমাতে ---- */
+function cacheGet_(key) {
+  try {
+    const v = CacheService.getScriptCache().get(key);
+    return v ? JSON.parse(v) : null;
+  } catch (e) {
+    return null;
+  }
+}
+function cachePut_(key, obj, seconds) {
+  try {
+    CacheService.getScriptCache().put(key, JSON.stringify(obj), seconds);
+  } catch (e) {
+    // ক্যাশ না হলেও কোনো সমস্যা নেই
+  }
+}
+function cacheDrop_(keys) {
+  try {
+    CacheService.getScriptCache().removeAll(keys);
+  } catch (e) {
+    // উপেক্ষা
+  }
+}
+
+function getSettingsObj_() {
+  let settings = cacheGet_("settings_v1");
+  if (!settings) {
+    const sheet = getSheet_("Settings");
+    const rows = sheet.getDataRange().getValues();
+    settings = {};
+    for (let i = 1; i < rows.length; i++) {
+      settings[rows[i][0]] = rows[i][1];
+    }
+    cachePut_("settings_v1", settings, 30);
+  }
+  settings.maintenanceMode = settings.maintenanceMode === true || settings.maintenanceMode === "TRUE";
+  return settings;
+}
+
+function setSettingsObj_(newSettings) {
+  cacheDrop_(["settings_v1"]);
+  const sheet = getSheet_("Settings");
+  const rows = sheet.getDataRange().getValues();
+  const keyRow = {};
+  for (let i = 1; i < rows.length; i++) keyRow[rows[i][0]] = i + 1;
+
+  Object.keys(newSettings).forEach((key) => {
+    if (key === "action" || key === "token") return;
+    const val = newSettings[key];
+    if (keyRow[key]) {
+      sheet.getRange(keyRow[key], 2).setValue(val);
+    } else {
+      sheet.appendRow([key, val]);
+    }
+  });
+}
+
+/* ---------------- Admin auth ---------------- */
+
+function checkAdminToken_(token) {
+  const admins = sheetToObjects_(getSheet_("Admins"));
+  return admins.some((a) => String(a.token) === String(token) && token);
+}
+
+function adminLogin_(username, password) {
+  const sheet = getSheet_("Admins");
+  const rows = sheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][0]) === String(username) && String(rows[i][1]) === String(password)) {
+      const token = Utilities.getUuid();
+      sheet.getRange(i + 1, 3).setValue(token);
+      return token;
+    }
+  }
+  return null;
+}
+
+/* ---------------- Registration ---------------- */
+
+function registerStudent_(data) {
+  const sheet = getSheet_("Registrations");
+  const id = Utilities.getUuid();
+  forceTextColumn_(sheet, REGISTRATION_HEADERS.indexOf("phone") + 1);
+  forceTextColumn_(sheet, REGISTRATION_HEADERS.indexOf("bkashSender") + 1);
+  forceTextColumn_(sheet, REGISTRATION_HEADERS.indexOf("transactionId") + 1);
+  appendRowByHeaders_(sheet, {
+    id,
+    name: data.name,
+    className: data.className,
+    school: data.school,
+    division: data.division,
+    phone: normalizePhone_(data.phone),
+    email: data.email,
+    password: data.password,
+    bkashSender: normalizePhone_(data.bkashSender),
+    transactionId: data.transactionId,
+    status: "pending", // পেমেন্ট যাচাইয়ের পর অ্যাডমিন কনফার্ম করবেন
+    note: "",
+    createdAt: new Date(),
+    studentToken: "",
+    tier: "paid",
+  });
+  return id;
+}
+
+function findRegistrationByContact_(phone, email) {
+  const rows = sheetToObjects_(getSheet_("Registrations"));
+  const matches = rows.filter(
+    (r) => normalizePhone_(r.phone) === normalizePhone_(phone) && String(r.email).trim().toLowerCase() === String(email).trim().toLowerCase()
+  );
+  return matches.length ? matches[matches.length - 1] : null;
+}
+
+/** ফোন নম্বর *অথবা* ইমেইল — যেকোনো একটা আগে থেকে থাকলেও ম্যাচ ধরা হয়, যাতে
+ *  একই ফোন বা একই ইমেইল দিয়ে দ্বিতীয়বার রেজিস্ট্রেশন করা না যায় (বিশেষত ফ্রি
+ *  টায়ারের অপব্যবহার ঠেকাতে জরুরি)। */
+function findRegistrationByPhoneOrEmail_(phone, email) {
+  const rows = sheetToObjects_(getSheet_("Registrations"));
+  const normPhone = normalizePhone_(phone);
+  const normEmail = String(email).trim().toLowerCase();
+  return rows.find(
+    (r) => (normPhone && normalizePhone_(r.phone) === normPhone) || (normEmail && String(r.email).trim().toLowerCase() === normEmail)
+  ) || null;
+}
+
+function findRegistrationById_(id) {
+  const rows = sheetToObjects_(getSheet_("Registrations"));
+  return rows.find((r) => String(r.id) === String(id)) || null;
+}
+
+/* ---------------- স্টুডেন্ট লগইন ---------------- */
+
+function studentLogin_(email, password) {
+  const sheet = getSheet_("Registrations");
+  const rows = sheet.getDataRange().getValues();
+  const headers = rows[0];
+  const emailCol = headers.indexOf("email");
+  const passCol = headers.indexOf("password");
+  const tokenCol = headers.indexOf("studentToken");
+
+  for (let i = 1; i < rows.length; i++) {
+    if (
+      String(rows[i][emailCol]).trim().toLowerCase() === String(email).trim().toLowerCase() &&
+      String(rows[i][passCol]) === String(password)
+    ) {
+      const token = Utilities.getUuid();
+      sheet.getRange(i + 1, tokenCol + 1).setValue(token);
+      return { token, row: rows[i], headers };
+    }
+  }
+  return null;
+}
+
+function findRegistrationByStudentToken_(token) {
+  if (!token) return null;
+  const rows = sheetToObjects_(getSheet_("Registrations"));
+  return rows.find((r) => String(r.studentToken) === String(token)) || null;
+}
+
+/* ---------------- নোটিশ ---------------- */
+
+function addNotice_(message) {
+  const sheet = getSheet_("Notices");
+  const id = Utilities.getUuid();
+  appendRowByHeaders_(sheet, { id, message, active: true, createdAt: new Date() });
+  return id;
+}
+
+function listActiveNotices_() {
+  const rows = sheetToObjects_(getSheet_("Notices"));
+  return rows
+    .filter((n) => n.active === true || n.active === "TRUE")
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .map((n) => ({ id: n.id, message: n.message, createdAt: n.createdAt }));
+}
+
+/* ---------------- যোগাযোগ ফর্ম ---------------- */
+
+function addContact_(data) {
+  const sheet = getSheet_("Contacts");
+  const id = Utilities.getUuid();
+  appendRowByHeaders_(sheet, {
+    id,
+    email: data.email,
+    phone: normalizePhone_(data.phone),
+    message: data.message,
+    status: "new",
+    createdAt: new Date(),
+  });
+  return id;
+}
+
+/* ---------------- সাধারণ সহায়ক ---------------- */
+
+/* ---------------- লিখিত পরীক্ষার ডিফল্ট সময় (প্রশ্নে আলাদা সময় না থাকলে) ---------------- */
+
+function getWrittenMinutes_() {
+  const n = Number(getSettingsObj_().writtenMinutes);
+  return n > 0 ? Math.round(n) : 25;
+}
+
+/* ---------------- লাইভ পরীক্ষা (একাধিক, একই দিনেও) ---------------- */
+
+function toIso_(v) {
+  if (!v) return "";
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? "" : d.toISOString();
+}
+
+function listLiveExams_() {
+  const cached = cacheGet_("liveExams_v1");
+  if (cached) return cached;
+  const list = sheetToObjects_(getSheet_("LiveExams"))
+    .filter((e) => e.id)
+    .map((e) => ({
+      id: String(e.id),
+      title: e.title || "লাইভ পরীক্ষা",
+      start: toIso_(e.start),
+      end: toIso_(e.end),
+      minutes: Number(e.minutes) > 0 ? Math.round(Number(e.minutes)) : 25,
+    }))
+    .sort((a, b) => new Date(a.start) - new Date(b.start));
+  cachePut_("liveExams_v1", list, 30);
+  return list;
+}
+
+function findLiveExam_(id) {
+  return listLiveExams_().find((e) => e.id === String(id)) || null;
+}
+
+/** কোন কোন লাইভ পরীক্ষায় এই স্টুডেন্ট ইতিমধ্যে অংশ নিয়েছে (জমা দিয়েছে) তার আইডির সেট। */
+function participatedLiveExamIds_(registrationId) {
+  const rows = sheetToObjects_(getSheet_("WrittenAttempts")).filter(
+    (a) => String(a.registrationId) === String(registrationId) && a.examType === "live" && a.liveExamId
+  );
+  return new Set(rows.map((a) => String(a.liveExamId)));
+}
+
+/** প্রতিটা লাইভ পরীক্ষার অবস্থা: upcoming | open | closed, আর স্টুডেন্ট অংশ নিয়েছে কিনা।
+ *  স্টুডেন্ট প্রতিটা লাইভ পরীক্ষায় একবারই অংশ নিতে পারে, কিন্তু আলাদা আলাদা লাইভ পরীক্ষা
+ *  (একই দিনেও) যতগুলো খুশি নিতে পারে। */
+function liveExamsWithStatus_(registrationId) {
+  const now = new Date();
+  const done = registrationId ? participatedLiveExamIds_(registrationId) : new Set();
+  return listLiveExams_().map((e) => {
+    const start = new Date(e.start);
+    const end = new Date(e.end);
+    let status = "open";
+    if (now < start) status = "upcoming";
+    else if (now > end) status = "closed";
+    return { ...e, status, participated: done.has(e.id) };
+  });
+}
+
+/* ---------------- লিখিত পরীক্ষা ---------------- */
+
+/** একটা প্যাসেজ (উদ্দীপক) একাধিক প্রশ্নসহ যোগ করা হয়। q.subQuestions একটা
+ *  অ্যারে: [{text, points, imageUrl?, imageBase64?}, ...]। kind: "written"
+ *  (লিখিত)। status: "draft" | "published"।
+ *
+ *  ছবি-প্রশ্ন: অ্যাডমিন উদ্দীপক (passageImageBase64) এবং/অথবা প্রতিটা প্রশ্নের
+ *  (sq.imageBase64) জন্য ছবি দিতে পারেন — ছবিগুলো এই স্ক্রিপ্ট যে Google
+ *  অ্যাকাউন্টে চলছে (ডেটাবেজ অ্যাকাউন্ট) তার Drive-এর "Math Olympiad Question Images"
+ *  ফোল্ডারে সেভ হয় এবং স্টুডেন্টরা পরীক্ষায় সেটা দেখতে পায়। লেখা ছাড়া শুধু ছবি
+ *  দিয়েও প্রশ্ন যোগ করা যায়। এডিটের সময় আগের ছবির URL (passageImageUrl /
+ *  sq.imageUrl) ফেরত এলে সেটাই রাখা হয়; খালি পাঠালে ছবি সরে যায়। */
+function resolveQuestionImage_(base64, existingUrl, prefix) {
+  if (base64) {
+    return uploadImageToDrive_(base64, "image/jpeg", prefix + "_" + Utilities.getUuid() + ".jpg", QUESTION_IMAGE_FOLDER);
+  }
+  return existingUrl || "";
+}
+
+/** টপিক ট্যাগ: কমা দিয়ে আলাদা করা লেখা (বা অ্যারে) → পরিষ্কার "ক, খ, গ" স্ট্রিং */
+function cleanTopics_(v) {
+  const arr = Array.isArray(v) ? v : String(v || "").split(",");
+  const seen = {};
+  return arr
+    .map((t) => String(t).trim())
+    .filter((t) => t && !seen[t] && (seen[t] = true))
+    .slice(0, 6)
+    .join(", ");
+}
+
+/** প্রকাশের সময় ভবিষ্যতে হলে প্রশ্নটা এখনো স্টুডেন্টদের কাছে লুকানো (স্বয়ংক্রিয় প্রকাশ) */
+function isLiveNow_(q) {
+  return !q.publishAt || new Date(q.publishAt) <= new Date();
+}
+
+function buildSubQuestions_(list, keepIds) {
+  return (list || []).map((sq) => ({
+    id: keepIds && sq.id ? sq.id : Utilities.getUuid(),
+    text: sq.text || "",
+    points: sq.points || 10,
+    imageUrl: resolveQuestionImage_(sq.imageBase64, sq.imageUrl, "q"),
+  }));
+}
+
+function addWrittenQuestion_(q) {
+  const sheet = getSheet_("WrittenQuestions");
+  const id = Utilities.getUuid();
+  const subQuestions = buildSubQuestions_(q.subQuestions, false);
+  appendRowByHeaders_(sheet, {
+    id,
+    passageHtml: q.passageHtml || "",
+    passageImageUrl: resolveQuestionImage_(q.passageImageBase64, q.passageImageUrl, "passage"),
+    questionsJson: JSON.stringify(subQuestions),
+    kind: q.kind || "written",
+    status: q.status === "published" ? "published" : "draft",
+    forMock: q.forMock !== false,
+    forLive: !!q.forLive,
+    liveExamId: q.forLive && q.liveExamId ? String(q.liveExamId) : "",
+    testNo: q.forMock !== false ? (Number(q.testNo) > 0 ? Math.round(Number(q.testNo)) : nextTestNo_()) : "",
+    minutes: Number(q.minutes) > 0 ? Math.round(Number(q.minutes)) : "",
+    topics: cleanTopics_(q.topics),
+    solutionHtml: q.solutionHtml || "",
+    solutionImageUrl: resolveQuestionImage_(q.solutionImageBase64, q.solutionImageUrl, "solution"),
+    publishAt: toIso_(q.publishAt),
+    createdAt: new Date(),
+  });
+  return id;
+}
+
+function updateWrittenQuestion_(id, q) {
+  const sheet = getSheet_("WrittenQuestions");
+  const rowIdx = findRowIndexById_(sheet, id);
+  if (rowIdx === -1) return false;
+  const headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const col = (name) => headerRow.indexOf(name) + 1;
+  const subQuestions = buildSubQuestions_(q.subQuestions, true);
+  sheet.getRange(rowIdx, col("passageHtml")).setValue(q.passageHtml || "");
+  sheet.getRange(rowIdx, col("passageImageUrl")).setValue(resolveQuestionImage_(q.passageImageBase64, q.passageImageUrl, "passage"));
+  sheet.getRange(rowIdx, col("questionsJson")).setValue(JSON.stringify(subQuestions));
+  sheet.getRange(rowIdx, col("kind")).setValue(q.kind || "written");
+  sheet.getRange(rowIdx, col("status")).setValue(q.status === "published" ? "published" : "draft");
+  sheet.getRange(rowIdx, col("forMock")).setValue(q.forMock !== false);
+  sheet.getRange(rowIdx, col("forLive")).setValue(!!q.forLive);
+  sheet.getRange(rowIdx, col("liveExamId")).setValue(q.forLive && q.liveExamId ? String(q.liveExamId) : "");
+  sheet.getRange(rowIdx, col("minutes")).setValue(Number(q.minutes) > 0 ? Math.round(Number(q.minutes)) : "");
+  sheet.getRange(rowIdx, col("topics")).setValue(cleanTopics_(q.topics));
+  sheet.getRange(rowIdx, col("solutionHtml")).setValue(q.solutionHtml || "");
+  sheet.getRange(rowIdx, col("solutionImageUrl")).setValue(resolveQuestionImage_(q.solutionImageBase64, q.solutionImageUrl, "solution"));
+  sheet.getRange(rowIdx, col("publishAt")).setValue(toIso_(q.publishAt));
+  if (q.forMock !== false) {
+    sheet.getRange(rowIdx, col("testNo")).setValue(Number(q.testNo) > 0 ? Math.round(Number(q.testNo)) : nextTestNo_());
+  } else {
+    sheet.getRange(rowIdx, col("testNo")).setValue("");
+  }
+  return true;
+}
+
+/** ফর্মের তথ্য ঠিক আছে কিনা যাচাই — লিখিতে উদ্দীপকের লেখা, উদ্দীপকের ছবি,
+ *  অথবা অন্তত একটা প্রশ্নের লেখা/ছবি — এর যেকোনো একটা থাকতে হবে (শুধু ছবি দিয়েও
+ *  চলবে)। null ফেরত মানে ঠিক আছে। */
+function validateWrittenQuestion_(q) {
+  const subs = q.subQuestions || [];
+  if (subs.length === 0) return "অন্তত একটা প্রশ্ন যোগ করুন।";
+  const hasText = (html) => String(html || "").replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim() !== "";
+  if (q.forMock !== false && Number(q.testNo) > 0 && testNoTaken_(q.testNo, q.id)) {
+    return modelTestTitle_(q.testNo) + " নম্বরটা আগে থেকেই আরেকটা প্রশ্নে আছে। অন্য নম্বর দিন বা ফাঁকা রাখুন।";
+  }
+  const hasPassage = hasText(q.passageHtml) || q.passageImageBase64 || q.passageImageUrl;
+  const hasAnySub = subs.some((sq) => hasText(sq.text) || sq.imageBase64 || sq.imageUrl);
+  if (!hasPassage && !hasAnySub) return "উদ্দীপক বা প্রশ্নের লেখা অথবা ছবি দিন।";
+  return null;
+}
+
+function isTrue_(v) {
+  return v === true || String(v).toLowerCase() === "true";
+}
+
+function modelTestTitle_(no) {
+  const n = Number(no);
+  return "Model Test-" + (n < 10 ? "0" + n : String(n));
+}
+
+/** forMock প্রশ্নগুলোর মধ্যে যেগুলোর মডেল টেস্ট নম্বর (testNo) নেই, সেগুলোকে তৈরির ক্রম অনুযায়ী
+ *  পরপর নম্বর দেয়। এর ফলে আগে থেকে থাকা সব প্রশ্ন আপডেটের পর নিজে নিজেই Model Test-01, 02, ...
+ *  হিসেবে চলে আসে। নম্বর একবার বসলে আর বদলায় না (অন্য টেস্ট মুছলেও)। */
+function ensureModelNumbers_() {
+  const sheet = getSheet_("WrittenQuestions");
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return;
+  const h = values[0];
+  const cNo = h.indexOf("testNo"), cMock = h.indexOf("forMock"), cAt = h.indexOf("createdAt");
+  if (cNo === -1 || cMock === -1) return;
+  let max = 0;
+  const missing = [];
+  for (let i = 1; i < values.length; i++) {
+    const r = values[i];
+    if (!r[0] || !isTrue_(r[cMock])) continue;
+    const n = Number(r[cNo]);
+    if (n > 0) max = Math.max(max, n);
+    else missing.push({ row: i + 1, at: new Date(r[cAt]).getTime() || 0 });
+  }
+  missing.sort((a, b) => a.at - b.at);
+  missing.forEach((m) => {
+    max += 1;
+    sheet.getRange(m.row, cNo + 1).setValue(max);
+  });
+}
+
+function nextTestNo_() {
+  ensureModelNumbers_();
+  const nos = sheetToObjects_(getSheet_("WrittenQuestions")).map((q) => Number(q.testNo) || 0);
+  return Math.max(0, ...nos) + 1;
+}
+
+/** অন্য কোনো প্রশ্নে এই মডেল টেস্ট নম্বর আগে থেকেই আছে কিনা */
+function testNoTaken_(no, exceptId) {
+  return sheetToObjects_(getSheet_("WrittenQuestions")).some(
+    (q) => String(q.id) !== String(exceptId || "") && isTrue_(q.forMock) && Number(q.testNo) === Number(no)
+  );
+}
+
+function parsedWrittenQuestions_() {
+  return sheetToObjects_(getSheet_("WrittenQuestions")).map((q) => ({
+    ...q,
+    testNo: Number(q.testNo) || 0,
+    testTitle: Number(q.testNo) > 0 ? modelTestTitle_(q.testNo) : "",
+    minutes: Number(q.minutes) > 0 ? Math.round(Number(q.minutes)) : "",
+    subQuestions: (() => {
+      try {
+        return JSON.parse(q.questionsJson || "[]");
+      } catch (e) {
+        return [];
+      }
+    })(),
+  }));
+}
+
+/** প্রকাশিত মডেল টেস্টগুলো (নম্বর অনুযায়ী সাজানো) */
+function publishedModelTests_() {
+  ensureModelNumbers_();
+  return parsedWrittenQuestions_()
+    .filter((q) => q.status === "published" && isLiveNow_(q) && isTrue_(q.forMock) && (q.kind || "written") === "written")
+    .sort((a, b) => a.testNo - b.testNo);
+}
+
+function formatSet_(q) {
+  return {
+    id: q.id,
+    passageHtml: q.passageHtml,
+    passageImageUrl: q.passageImageUrl || "",
+    subQuestions: (q.subQuestions || []).map((sq) => ({ ...sq, writtenQuestionId: q.id })),
+  };
+}
+
+/** স্টুডেন্টের জন্য মডেল টেস্টের তালিকা — প্রশ্ন নয়, শুধু তথ্য (নাম, সময়, প্রশ্ন সংখ্যা, মোট নম্বর)
+ *  আর স্টুডেন্ট নিজে কতবার দিয়েছে ও সর্বশেষ ফলাফল। registrationId না দিলে attempts ফাঁকা থাকে। */
+function listModelTests_(registrationId) {
+  const defaultMinutes = getWrittenMinutes_();
+  const rows = registrationId
+    ? sheetToObjects_(getSheet_("WrittenAttempts")).filter(
+        (a) => String(a.registrationId) === String(registrationId) && a.examType === "mock"
+      )
+    : [];
+  return publishedModelTests_().map((q) => {
+    const mine = rows.filter((a) => String(a.writtenQuestionId) === String(q.id));
+    const sessions = {};
+    mine.forEach((a) => {
+      const k = String(a.sessionId);
+      if (!sessions[k]) sessions[k] = { at: a.createdAt, score: 0, total: 0, graded: true };
+      sessions[k].total += Number(a.points) || 0;
+      if (a.status === "graded") sessions[k].score += Number(a.score) || 0;
+      else sessions[k].graded = false;
+    });
+    const list = Object.values(sessions).sort((x, y) => new Date(y.at) - new Date(x.at));
+    const last = list[0];
+    return {
+      id: q.id,
+      testNo: q.testNo,
+      title: q.testTitle,
+      minutes: q.minutes || defaultMinutes,
+      questionCount: (q.subQuestions || []).length,
+      totalPoints: (q.subQuestions || []).reduce((sum, sq) => sum + (Number(sq.points) || 0), 0),
+      attemptCount: list.length,
+      last: last ? { graded: last.graded, score: last.score, total: last.total } : null,
+    };
+  });
+}
+
+/** লাইভ পরীক্ষার প্রশ্ন: ওই লাইভ পরীক্ষায় বাঁধা (বা কোনো লাইভে বাঁধা নেই এমন) সব প্রকাশিত forLive
+ *  প্রশ্ন-সেট, নির্দিষ্ট ক্রমে — র‍্যান্ডম নয়, সবার জন্য একই। */
+function getLiveSets_(liveExamId) {
+  return parsedWrittenQuestions_()
+    .filter(
+      (q) =>
+        q.status === "published" &&
+        isLiveNow_(q) &&
+        (q.kind || "written") === "written" &&
+        isTrue_(q.forLive) &&
+        (!q.liveExamId || String(q.liveExamId) === String(liveExamId))
+    )
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .map(formatSet_);
+}
+/** ব্রাউজার থেকে পাঠানো base64 ছবি Google Drive-এ আপলোড করে এবং শেয়ারড লিংক ফেরত দেয়। */
+const ANSWER_IMAGE_FOLDER = "Math Olympiad Written Answers";
+const QUESTION_IMAGE_FOLDER = "Math Olympiad Question Images";
+
+function uploadImageToDrive_(base64Data, mimeType, filename, folderNameArg) {
+  const folderName = folderNameArg || ANSWER_IMAGE_FOLDER;
+  const folders = DriveApp.getFoldersByName(folderName);
+  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+
+  const bytes = Utilities.base64Decode(base64Data.replace(/^data:[^;]+;base64,/, ""));
+  const blob = Utilities.newBlob(bytes, mimeType || "image/jpeg", filename);
+  const file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return "https://lh3.googleusercontent.com/d/" + file.getId();
+}
+
+function saveWrittenAttempt_(data) {
+  const sheet = getSheet_("WrittenAttempts");
+  const id = Utilities.getUuid();
+  appendRowByHeaders_(sheet, {
+    id,
+    registrationId: data.registrationId || "",
+    phone: data.phone,
+    email: data.email,
+    examType: data.examType,
+    kind: data.kind,
+    sessionId: data.sessionId,
+    writtenQuestionId: data.writtenQuestionId,
+    subQuestionId: data.subQuestionId,
+    subQuestionText: data.subQuestionText,
+    subQuestionImageUrl: data.subQuestionImageUrl || "",
+    liveExamId: data.liveExamId || "",
+    points: data.points,
+    imageUrl: data.imageUrl,
+    status: "pending",
+    score: "",
+    annotatedImageUrl: "",
+    adminComment: "",
+    createdAt: new Date(),
+    gradedAt: "",
+  });
+  return id;
+}
+
+function listWrittenAttemptsForStudent_(registrationId) {
+  const rows = sheetToObjects_(getSheet_("WrittenAttempts")).filter(
+    (a) => String(a.registrationId) === String(registrationId)
+  );
+  const liveById = {};
+  listLiveExams_().forEach((e) => (liveById[e.id] = e));
+  const qById = {};
+  parsedWrittenQuestions_().forEach((q) => (qById[String(q.id)] = q));
+  const now = new Date();
+
+  const sessions = {};
+  rows.forEach((a) => {
+    const q = qById[String(a.writtenQuestionId)] || {};
+    if (!sessions[a.sessionId]) {
+      const live = liveById[String(a.liveExamId)];
+      sessions[a.sessionId] = {
+        sessionId: a.sessionId,
+        examType: a.examType,
+        kind: a.kind,
+        createdAt: a.createdAt,
+        liveExamTitle: live ? live.title : "",
+        liveEnded: live ? now > new Date(live.end) : true,
+        testTitle: a.examType === "mock" ? q.testTitle || "" : "",
+        items: [],
+      };
+    }
+    sessions[a.sessionId].items.push({ ...a, topics: q.topics || "" });
+  });
+
+  return Object.values(sessions)
+    .map((sess) => {
+      const allGraded = sess.items.every((it) => it.status === "graded");
+      // সমাধান শুধু মূল্যায়ন শেষ হলে; লাইভ পরীক্ষায় আরও শর্ত — লাইভের সময়সীমা শেষ হতে হবে
+      if (allGraded && (sess.examType === "mock" || sess.liveEnded)) {
+        const solutions = {};
+        sess.items.forEach((it) => {
+          const q = qById[String(it.writtenQuestionId)];
+          if (q && !solutions[q.id] && (q.solutionHtml || q.solutionImageUrl)) {
+            solutions[q.id] = { html: q.solutionHtml || "", imageUrl: q.solutionImageUrl || "" };
+          }
+        });
+        sess.solutions = solutions;
+      }
+      delete sess.liveEnded;
+      return sess;
+    })
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function listPendingWrittenAttempts_() {
+  const pending = sheetToObjects_(getSheet_("WrittenAttempts")).filter((a) => a.status === "pending");
+  const questions = parsedWrittenQuestions_();
+  const byId = {};
+  questions.forEach((q) => (byId[q.id] = q));
+  return pending.map((a) => ({
+    ...a,
+    passageHtml: (byId[a.writtenQuestionId] || {}).passageHtml || "",
+    passageImageUrl: (byId[a.writtenQuestionId] || {}).passageImageUrl || "",
+    testTitle: a.examType === "mock" ? (byId[a.writtenQuestionId] || {}).testTitle || "" : "",
+  }));
+}
+
+function gradeWrittenAttempt_(id, score, annotatedImageUrl, adminComment) {
+  const sheet = getSheet_("WrittenAttempts");
+  const rowIdx = findRowIndexById_(sheet, id);
+  if (rowIdx === -1) return false;
+  const col = (name) => WRITTEN_ATTEMPT_HEADERS.indexOf(name) + 1;
+  sheet.getRange(rowIdx, col("status")).setValue("graded");
+  sheet.getRange(rowIdx, col("score")).setValue(score);
+  sheet.getRange(rowIdx, col("annotatedImageUrl")).setValue(annotatedImageUrl || "");
+  sheet.getRange(rowIdx, col("adminComment")).setValue(adminComment || "");
+  sheet.getRange(rowIdx, col("gradedAt")).setValue(new Date());
+  return true;
+}
+
+/** একটা পুরো গ্রুপ (একই ছবির সাথে যুক্ত সবগুলো প্রশ্ন — যেমন একটা উদ্দীপকের
+ *  সবকটা প্রশ্ন) একসাথে মূল্যায়ন করে — প্রতিটার নম্বর
+ *  আলাদা, কিন্তু দাগানো ছবি ও মন্তব্য সবগুলোর জন্য একই। */
+/* ---------------- ইমেইল (MailApp) — ব্যর্থ হলেও মূল কাজ থামে না ---------------- */
+
+function sendMailSafe_(to, subject, htmlBody) {
+  try {
+    if (!to) return;
+    MailApp.sendEmail({ to: String(to), subject, htmlBody, name: "অগ্রদূত গণিত অলিম্পিয়াড" });
+  } catch (e) {
+    Logger.log("ইমেইল পাঠানো যায়নি: " + e);
+  }
+}
+
+function mailLayout_(title, lines) {
+  const site = String(getSettingsObj_().siteUrl || "").replace(/\/$/, "");
+  const link = site ? '<p><a href="' + site + '/student/login" style="background:#0f3d3e;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">স্টুডেন্ট পোর্টাল খুলুন</a></p>' : "";
+  return (
+    '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;border:1px solid #ddd;border-radius:10px;padding:20px">' +
+    '<h2 style="color:#0f3d3e;margin-top:0">' + title + "</h2>" +
+    lines.map((l) => "<p>" + l + "</p>").join("") + link +
+    '<p style="color:#888;font-size:12px">— অগ্রদূত · গণিত অলিম্পিয়াড প্রস্তুতি কোর্স</p></div>'
+  );
+}
+
+function notifyRegistrationConfirmed_(reg) {
+  sendMailSafe_(
+    reg.email,
+    "আপনার নিবন্ধন কনফার্ম হয়েছে ✓",
+    mailLayout_("অভিনন্দন, " + reg.name + "!", ["আপনার গণিত অলিম্পিয়াড প্রস্তুতি কোর্সের নিবন্ধন কনফার্ম হয়েছে।", "এখন নিবন্ধনের সময় দেওয়া ইমেইল ও পাসওয়ার্ড দিয়ে স্টুডেন্ট পোর্টালে লগইন করে পরীক্ষা দিতে পারবেন।"])
+  );
+}
+
+/** একটা পরীক্ষা-সেশনের সবগুলো খাতা মূল্যায়ন হয়ে গেলে স্টুডেন্টকে ইমেইল */
+function notifyIfSessionGraded_(itemIds) {
+  const all = sheetToObjects_(getSheet_("WrittenAttempts"));
+  const idSet = {};
+  itemIds.forEach((id) => (idSet[String(id)] = true));
+  const sessionIds = {};
+  all.forEach((a) => {
+    if (idSet[String(a.id)]) sessionIds[String(a.sessionId)] = String(a.registrationId);
+  });
+  Object.keys(sessionIds).forEach((sid) => {
+    const rows = all.filter((a) => String(a.sessionId) === sid);
+    if (rows.length === 0 || !rows.every((a) => a.status === "graded")) return;
+    const reg = findRegistrationById_(sessionIds[sid]);
+    if (!reg) return;
+    const score = rows.reduce((n, a) => n + (Number(a.score) || 0), 0);
+    const total = rows.reduce((n, a) => n + (Number(a.points) || 0), 0);
+    sendMailSafe_(
+      reg.email,
+      "আপনার খাতার মূল্যায়ন শেষ — " + score + "/" + total,
+      mailLayout_("আপনার ফলাফল এসেছে", ["প্রিয় " + reg.name + ", আপনার জমা দেওয়া খাতার মূল্যায়ন শেষ হয়েছে।", "<b>প্রাপ্ত নম্বর: " + score + " / " + total + "</b>", "মেন্টরের দাগ ও মন্তব্য দেখতে পোর্টালে যান।"])
+    );
+  });
+}
+
+/** [সময়-ভিত্তিক ট্রিগার, প্রতি ১০ মিনিটে] আসন্ন লাইভ পরীক্ষার আগে (৩৫ মিনিটের মধ্যে) একবার করে কনফার্মড স্টুডেন্টদের মনে করিয়ে দেয় */
+function liveReminderTick() {
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+  listLiveExams_().forEach((e) => {
+    const diff = new Date(e.start).getTime() - now;
+    if (diff <= 0 || diff > 35 * 60000 || props.getProperty("rem_" + e.id)) return;
+    const mins = Math.max(1, Math.round(diff / 60000));
+    const emails = sheetToObjects_(getSheet_("Registrations"))
+      .filter((r) => r.status === "confirmed" && r.email)
+      .map((r) => String(r.email));
+    for (let i = 0; i < emails.length; i += 40) {
+      try {
+        MailApp.sendEmail({
+          to: Session.getEffectiveUser().getEmail(),
+          bcc: emails.slice(i, i + 40).join(","),
+          subject: "লাইভ পরীক্ষা শুরু হচ্ছে — " + e.title,
+          htmlBody: mailLayout_("লাইভ পরীক্ষা শুরু হতে ~" + mins + " মিনিট বাকি", ["<b>" + e.title + "</b> শীঘ্রই শুরু হচ্ছে। সময়কাল " + e.minutes + " মিনিট।", "ভালো ইন্টারনেট সংযোগ নিশ্চিত করে পোর্টালের লাইভ পরীক্ষা অংশে যান।"]),
+          name: "অগ্রদূত গণিত অলিম্পিয়াড",
+        });
+      } catch (err) {
+        Logger.log("রিমাইন্ডার ব্যর্থ: " + err);
+      }
+    }
+    props.setProperty("rem_" + e.id, String(now));
+  });
+}
+
+/** [সময়-ভিত্তিক ট্রিগার, প্রতিদিন রাত ৩টায়] পুরো ডেটাবেজ শিটের একটা কপি Drive-এর "Math Olympiad Backups" ফোল্ডারে; শেষ ১৪টা রাখা হয় */
+function dailyBackup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const it = DriveApp.getFoldersByName("Math Olympiad Backups");
+  const folder = it.hasNext() ? it.next() : DriveApp.createFolder("Math Olympiad Backups");
+  const stamp = Utilities.formatDate(new Date(), "Asia/Dhaka", "yyyy-MM-dd");
+  DriveApp.getFileById(ss.getId()).makeCopy("Math Olympiad Backup " + stamp, folder);
+  const files = [];
+  const fit = folder.getFiles();
+  while (fit.hasNext()) files.push(fit.next());
+  files.sort((a, b) => b.getDateCreated() - a.getDateCreated());
+  files.slice(14).forEach((f) => f.setTrashed(true));
+}
+
+function installTriggers_() {
+  try {
+    ScriptApp.getProjectTriggers().forEach((t) => {
+      const f = t.getHandlerFunction();
+      if (f === "dailyBackup" || f === "liveReminderTick") ScriptApp.deleteTrigger(t);
+    });
+    ScriptApp.newTrigger("dailyBackup").timeBased().everyDays(1).atHour(3).create();
+    ScriptApp.newTrigger("liveReminderTick").timeBased().everyMinutes(10).create();
+  } catch (e) {
+    Logger.log("ট্রিগার বসানো যায়নি (অনুমতি দিয়ে setup আবার Run করুন): " + e);
+  }
+}
+
+/* ---------------- অ্যাডমিন: পরিসংখ্যান ও এক্সপোর্ট ---------------- */
+
+function plainSnippet_(html, fallback) {
+  const t = String(html || "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  return t ? (t.length > 70 ? t.slice(0, 70) + "…" : t) : fallback;
+}
+
+function buildAdminStats_() {
+  const regs = sheetToObjects_(getSheet_("Registrations"));
+  const attempts = sheetToObjects_(getSheet_("WrittenAttempts"));
+  const qs = parsedWrittenQuestions_();
+  const qById = {};
+  qs.forEach((q) => (qById[String(q.id)] = q));
+
+  const registrations = {
+    total: regs.length,
+    pending: regs.filter((r) => r.status === "pending").length,
+    confirmed: regs.filter((r) => r.status === "confirmed").length,
+    rejected: regs.filter((r) => r.status === "rejected").length,
+  };
+
+  const pendingImages = {};
+  attempts.filter((a) => a.status === "pending").forEach((a) => (pendingImages[a.imageUrl] = true));
+
+  // মডেল টেস্ট ধরে
+  const byTest = {};
+  attempts.filter((a) => a.examType === "mock").forEach((a) => {
+    const id = String(a.writtenQuestionId);
+    if (!byTest[id]) byTest[id] = { sessions: {}, students: {}, score: 0, points: 0, pending: 0 };
+    const t = byTest[id];
+    t.sessions[a.sessionId] = true;
+    t.students[a.registrationId] = true;
+    if (a.status === "graded") {
+      t.score += Number(a.score) || 0;
+      t.points += Number(a.points) || 0;
+    } else t.pending++;
+  });
+  const tests = Object.keys(byTest)
+    .map((id) => {
+      const t = byTest[id];
+      const q = qById[id] || {};
+      return {
+        title: q.testTitle || "(মোছা হয়েছে)",
+        testNo: q.testNo || 999,
+        sessions: Object.keys(t.sessions).length,
+        students: Object.keys(t.students).length,
+        pending: t.pending,
+        avgPercent: t.points ? Math.round((t.score / t.points) * 100) : null,
+      };
+    })
+    .sort((a, b) => a.testNo - b.testNo);
+
+  // সবচেয়ে কঠিন প্রশ্ন (গড় % সবচেয়ে কম)
+  const byQ = {};
+  attempts.filter((a) => a.status === "graded" && Number(a.points) > 0).forEach((a) => {
+    const key = a.writtenQuestionId + "|" + a.subQuestionId;
+    if (!byQ[key]) byQ[key] = { qid: String(a.writtenQuestionId), text: a.subQuestionText, hasImg: !!a.subQuestionImageUrl, score: 0, points: 0, n: 0 };
+    byQ[key].score += Number(a.score) || 0;
+    byQ[key].points += Number(a.points) || 0;
+    byQ[key].n++;
+  });
+  const hardQuestions = Object.values(byQ)
+    .map((x) => ({
+      test: (qById[x.qid] || {}).testTitle || (attempts.some((a) => String(a.writtenQuestionId) === x.qid && a.examType === "live") ? "লাইভ" : ""),
+      text: plainSnippet_(x.text, x.hasImg ? "(ছবির প্রশ্ন)" : "প্রশ্ন"),
+      avgPercent: Math.round((x.score / x.points) * 100),
+      answers: x.n,
+    }))
+    .sort((a, b) => a.avgPercent - b.avgPercent)
+    .slice(0, 8);
+
+  // লাইভ পরীক্ষা ধরে অংশগ্রহণ
+  const live = listLiveExams_().map((e) => {
+    const ps = {};
+    attempts.filter((a) => a.examType === "live" && String(a.liveExamId) === e.id).forEach((a) => (ps[a.registrationId] = true));
+    return { title: e.title, participants: Object.keys(ps).length };
+  });
+
+  return { registrations, pendingGrading: Object.keys(pendingImages).length, tests, hardQuestions, live };
+}
+
+/** সব সেশনের ফলাফল সারি আকারে — অ্যাডমিন ব্রাউজারে CSV/Excel বানাবে */
+function buildResultsExport_() {
+  const regs = {};
+  sheetToObjects_(getSheet_("Registrations")).forEach((r) => (regs[String(r.id)] = r));
+  const qById = {};
+  parsedWrittenQuestions_().forEach((q) => (qById[String(q.id)] = q));
+  const liveTitle = {};
+  listLiveExams_().forEach((e) => (liveTitle[e.id] = e.title));
+  const sessions = {};
+  sheetToObjects_(getSheet_("WrittenAttempts")).forEach((a) => {
+    const k = String(a.sessionId);
+    if (!sessions[k]) {
+      const r = regs[String(a.registrationId)] || {};
+      const q = qById[String(a.writtenQuestionId)] || {};
+      sessions[k] = {
+        name: r.name || "", className: r.className || "", school: r.school || "", division: r.division || "",
+        phone: r.phone || "", email: r.email || "",
+        exam: a.examType === "live" ? liveTitle[String(a.liveExamId)] || "লাইভ" : q.testTitle || "Model Test",
+        type: a.examType === "live" ? "লাইভ" : "মডেল টেস্ট",
+        date: a.createdAt, score: 0, total: 0, allGraded: true,
+      };
+    }
+    const sess = sessions[k];
+    sess.total += Number(a.points) || 0;
+    if (a.status === "graded") sess.score += Number(a.score) || 0;
+    else sess.allGraded = false;
+  });
+  return Object.values(sessions)
+    .map((x) => ({ ...x, status: x.allGraded ? "মূল্যায়িত" : "পেন্ডিং", score: x.allGraded ? x.score : "" }))
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
+}
+
+function gradeWrittenAttemptsBatch_(items, annotatedImageUrl, adminComment) {
+  let count = 0;
+  items.forEach((item) => {
+    if (gradeWrittenAttempt_(item.id, item.score, annotatedImageUrl, adminComment)) count++;
+  });
+  return count;
+}
+
+/* ---------------- র‍্যাঙ্কিং / মেরিট তালিকা ---------------- */
+
+/** মেরিট তালিকা লিখিত পরীক্ষার *মূল্যায়ন শেষ হওয়া* নম্বরের উপর ভিত্তি করে। একটা সেশনের সবগুলো
+ *  প্রশ্নের নম্বর দেওয়া হয়ে গেলে তবেই সেটা তালিকায় ঢোকে।
+ *   - live + filterId: ওই লাইভ পরীক্ষার তালিকা; filterId ছাড়া: সব লাইভে প্রতিজনের সর্বোচ্চ সেশন।
+ *   - mock + filterId: ওই মডেল টেস্টের তালিকা (প্রতিজনের সর্বোচ্চ স্কোর, বহুবার দিলেও)।
+ *   - mock, filterId ছাড়া: প্রতিটা মডেল টেস্টে প্রতিজনের সর্বোচ্চ স্কোর যোগ করে মোট। */
+function getLeaderboard_(examType, filterId) {
+  const rows = sheetToObjects_(getSheet_("WrittenAttempts")).filter((a) => {
+    if (a.examType !== examType || a.kind !== "written") return false;
+    if (!filterId) return true;
+    return examType === "live" ? String(a.liveExamId) === String(filterId) : String(a.writtenQuestionId) === String(filterId);
+  });
+  const regs = sheetToObjects_(getSheet_("Registrations"));
+  const regById = {};
+  regs.forEach((r) => (regById[r.id] = r));
+
+  const sessions = {};
+  rows.forEach((a) => {
+    const key = String(a.sessionId);
+    if (!sessions[key]) {
+      sessions[key] = { registrationId: String(a.registrationId), testId: String(a.writtenQuestionId), score: 0, total: 0, allGraded: true, createdAt: a.createdAt };
+    }
+    const sess = sessions[key];
+    sess.total += Number(a.points) || 0;
+    if (a.status === "graded") sess.score += Number(a.score) || 0;
+    else sess.allGraded = false;
+    if (new Date(a.createdAt) < new Date(sess.createdAt)) sess.createdAt = a.createdAt;
+  });
+
+  const sumAcrossTests = examType === "mock" && !filterId;
+  const best = {};
+  Object.values(sessions)
+    .filter((sess) => sess.allGraded)
+    .forEach((sess) => {
+      const key = sumAcrossTests ? sess.registrationId + "|" + sess.testId : sess.registrationId;
+      if (!best[key] || sess.score > best[key].score) best[key] = sess;
+    });
+
+  let entries = Object.values(best);
+  if (sumAcrossTests) {
+    const byStudent = {};
+    entries.forEach((e) => {
+      if (!byStudent[e.registrationId]) byStudent[e.registrationId] = { registrationId: e.registrationId, score: 0, total: 0, createdAt: e.createdAt };
+      byStudent[e.registrationId].score += e.score;
+      byStudent[e.registrationId].total += e.total;
+      if (new Date(e.createdAt) > new Date(byStudent[e.registrationId].createdAt)) byStudent[e.registrationId].createdAt = e.createdAt;
+    });
+    entries = Object.values(byStudent);
+  }
+
+  return entries
+    .sort((a, b) => b.score - a.score || new Date(a.createdAt) - new Date(b.createdAt))
+    .slice(0, 20)
+    .map((sess) => {
+      const r = regById[sess.registrationId] || {};
+      return {
+        name: r.name || "অজানা",
+        className: r.className || "",
+        school: r.school || "",
+        division: r.division || "",
+        score: sess.score,
+        total: sess.total,
+      };
+    });
+}
+
+/* ---------------- অফলাইন পরীক্ষার প্রশ্নপত্র (PDF) ---------------- */
+
+// ওয়েবসাইটের বাংলা ফন্টের কাছাকাছি এবং Google Docs-এ নির্ভরযোগ্যভাবে পাওয়া যায় এমন ফন্ট
+const PDF_FONT = "Noto Sans Bengali";
+const CM_TO_PT = 28.35; // ১ সেন্টিমিটার = ২৮.৩৫ পয়েন্ট (Google Docs স্পেসিং এককে)
+
+/** সেটিংসে logoUrl দেওয়া থাকলে সেটা ফেচ করার চেষ্টা করে — ব্যর্থ হলে null
+ *  ফেরত দেয়, পিডিএফ তখন লোগো ছাড়াই শুধু লেখা দিয়ে হেডার বানায়। */
+function fetchLogoBlob_() {
+  try {
+    const settings = getSettingsObj_();
+    if (!settings.logoUrl) return null;
+    const res = UrlFetchApp.fetch(settings.logoUrl, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return null;
+    return res.getBlob();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** পাতার একদম উপরে ছোট, কমপ্যাক্ট হেডার — লোগো (থাকলে) + "অগ্রদূত পরীক্ষা
+ *  কেন্দ্র" + শিরোনাম + সাবটাইটেল, সবই ছোট ফন্টে যাতে অহেতুক জায়গা নষ্ট না হয়। */
+function addPdfHeader_(body, title, subtitle) {
+  const logo = fetchLogoBlob_();
+  if (logo) {
+    try {
+      const imgPara = body.appendParagraph("");
+      imgPara.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+      const img = imgPara.appendInlineImage(logo);
+      imgPara.setSpacingAfter(2);
+      img.setWidth(34);
+      img.setHeight(34);
+    } catch (e) {
+      // লোগো বসাতে সমস্যা হলেও বাকি ডকুমেন্ট চলতে থাকবে
+    }
+  }
+  body
+    .appendParagraph("অগ্রদূত পরীক্ষা কেন্দ্র")
+    .setAlignment(DocumentApp.HorizontalAlignment.CENTER)
+    .setFontFamily(PDF_FONT)
+    .setBold(true)
+    .setFontSize(13)
+    .setSpacingBefore(0)
+    .setSpacingAfter(2);
+  body
+    .appendParagraph(title)
+    .setAlignment(DocumentApp.HorizontalAlignment.CENTER)
+    .setFontFamily(PDF_FONT)
+    .setBold(true)
+    .setFontSize(11)
+    .setSpacingBefore(0)
+    .setSpacingAfter(1);
+  body
+    .appendParagraph(subtitle)
+    .setAlignment(DocumentApp.HorizontalAlignment.CENTER)
+    .setFontFamily(PDF_FONT)
+    .setFontSize(9)
+    .setSpacingBefore(0)
+    .setSpacingAfter(4);
+}
+
+/** সাধারণ HTML (আমাদের রিচ-টেক্সট এডিটর থেকে আসা) থেকে সাদামাটা প্লেইন টেক্সট
+ *  বের করে, লাইন ব্রেক ঠিক রেখে — Google Docs-এ রঙ/বোল্ড ফরম্যাটিং হুবহু
+ *  বসানো এই মুহূর্তে সাপোর্ট করা হয়নি, শুধু টেক্সট ও লাইন ব্রেক ঠিক থাকে। */
+function htmlToPlainLines_(html) {
+  if (!html) return [];
+  let text = String(html)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+  return text.split("\n").map((l) => l.trim()).filter((l, i, arr) => l !== "" || (i > 0 && arr[i - 1] !== ""));
+}
+
+/** পুরো ডকুমেন্টের সবকিছুতে (যা যা আলাদাভাবে ফন্ট সেট করা হয়নি) ওয়েবসাইটের
+ *  মতো বাংলা ফন্ট বসিয়ে দেয় — শেষে একবার কল করলেই পুরো ডকুমেন্ট কভার হয়। */
+function applyDocFont_(body) {
+  try {
+    body.editAsText().setFontFamily(PDF_FONT);
+  } catch (e) {
+    // ফন্ট সেট করা না গেলেও PDF তৈরি হতে থাকবে, ডিফল্ট ফন্টে
+  }
+}
+
+function docToBase64Pdf_(doc) {
+  applyDocFont_(doc.getBody());
+  doc.saveAndClose();
+  const file = DriveApp.getFileById(doc.getId());
+  const pdfBlob = file.getAs(MimeType.PDF);
+  const base64 = Utilities.base64Encode(pdfBlob.getBytes());
+  file.setTrashed(true); // অস্থায়ী Google Doc রাখার দরকার নেই, PDF হয়ে গেলে মুছে ফেলা হয়
+  return base64;
+}
+
+/** Drive-এ থাকা ছবি (lh3.googleusercontent.com/d/<id> লিংক) Google Doc-এ বসায় —
+ *  পাতার চওড়ার মধ্যে আটকে রাখতে অনুপাত ঠিক রেখে ছোট করা হয়। ব্যর্থ হলেও PDF
+ *  তৈরি হতে থাকে (শুধু ছবিটা বাদ পড়ে)। */
+function appendDriveImage_(body, url, maxWidth) {
+  try {
+    const m = String(url || "").match(/\/d\/([^/?&]+)/);
+    if (!m) return;
+    const blob = DriveApp.getFileById(m[1]).getBlob();
+    const img = body.appendImage(blob);
+    const w = img.getWidth();
+    const h = img.getHeight();
+    if (w > maxWidth) {
+      img.setWidth(maxWidth);
+      img.setHeight(Math.round((h * maxWidth) / w));
+    }
+  } catch (e) {
+    // ছবি বসানো না গেলেও বাকি প্রশ্নপত্র ঠিকঠাক তৈরি হবে
+  }
+}
+
+/** অফলাইন লিখিত প্রশ্নপত্র — ৩টা সেট, প্রতিটা আলাদা পাতায়। উদ্দীপক
+ *  উপরে ছোট ফন্টে, প্রতিটা প্রশ্নের নিচে দাগ না দিয়ে ২ সেন্টিমিটার ফাঁকা
+ *  জায়গা রাখা হয় ("উত্তরঃ" লিখে)। */
+function buildOfflineWrittenPdf_(modelTestId) {
+  let tests = publishedModelTests_();
+  if (modelTestId) tests = tests.filter((q) => String(q.id) === String(modelTestId));
+  if (tests.length === 0) throw new Error("কোনো প্রকাশিত মডেল টেস্ট পাওয়া যায়নি।");
+  const defaultMinutes = getWrittenMinutes_();
+
+  const doc = DocumentApp.create("Offline Written - " + new Date().toISOString());
+  const body = doc.getBody();
+  body.setMarginTop(20).setMarginBottom(20).setMarginLeft(30).setMarginRight(30);
+
+  tests.forEach((set, si) => {
+    if (si > 0) body.appendPageBreak();
+    addPdfHeader_(body, set.testTitle + " — লিখিত প্রশ্ন", "সময়: " + (set.minutes || defaultMinutes) + " মিনিট");
+
+    htmlToPlainLines_(set.passageHtml).forEach((line) => {
+      body.appendParagraph(line).setFontSize(9.5).setItalic(true).setSpacingBefore(0).setSpacingAfter(1);
+    });
+    if (set.passageImageUrl) appendDriveImage_(body, set.passageImageUrl, 500);
+    body.appendParagraph(" ").setFontSize(4);
+
+    (set.subQuestions || []).forEach((sq, qi) => {
+      const lines = htmlToPlainLines_(sq.text);
+      if (lines.length === 0) lines.push("প্রশ্ন নং " + (qi + 1));
+      lines.forEach((line, li) => {
+        body
+          .appendParagraph((li === 0 ? `${qi + 1}. ` : "    ") + line + (li === 0 ? ` (${sq.points} নম্বর)` : ""))
+          .setFontSize(10)
+          .setSpacingBefore(4)
+          .setSpacingAfter(0);
+      });
+      if (sq.imageUrl) appendDriveImage_(body, sq.imageUrl, 480);
+      // দাগ না দিয়ে "উত্তরঃ" লিখে ২ সেন্টিমিটার ফাঁকা জায়গা রাখা হচ্ছে
+      body.appendParagraph("উত্তরঃ").setFontSize(9.5).setSpacingBefore(2).setSpacingAfter(CM_TO_PT * 2);
+    });
+  });
+
+  return { base64: docToBase64Pdf_(doc), filename: "MathOlympiad-Written-" + Date.now() + ".pdf" };
+}
+
+/* ---------------- HTTP entry points ---------------- */
+
+function doGet(e) {
+  const action = e.parameter.action;
+  try {
+    if (action === "getSettings") {
+      return jsonOut_({ ok: true, data: getSettingsObj_() });
+    }
+    return jsonOut_({ ok: false, message: "অজানা action" });
+  } catch (err) {
+    return jsonOut_({ ok: false, message: String(err) });
+  }
+}
+
+function doPost(e) {
+  let body;
+  try {
+    body = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return jsonOut_({ ok: false, message: "ভুল রিকোয়েস্ট ফরম্যাট" });
+  }
+
+  const action = body.action;
+
+  try {
+    switch (action) {
+      case "register": {
+        if (!body.name || !body.phone || !body.email) {
+          return jsonOut_({ ok: false, message: "প্রয়োজনীয় তথ্য অনুপস্থিত" });
+        }
+        if (findRegistrationByPhoneOrEmail_(body.phone, body.email)) {
+          return jsonOut_({ ok: false, message: "এই মোবাইল নম্বর বা ইমেইল দিয়ে ইতিমধ্যে রেজিস্ট্রেশন করা আছে। একই তথ্য দিয়ে দ্বিতীয়বার রেজিস্ট্রেশন করা যাবে না।" });
+        }
+        const id = registerStudent_(body);
+        return jsonOut_({ ok: true, data: { id } });
+      }
+
+      case "checkStatus": {
+        const reg = findRegistrationByContact_(body.phone, body.email);
+        if (!reg) return jsonOut_({ ok: false, message: "কোনো রেজিস্ট্রেশন পাওয়া যায়নি।" });
+        return jsonOut_({
+          ok: true,
+          data: {
+            name: reg.name,
+            className: reg.className,
+            school: reg.school,
+            division: reg.division,
+            status: reg.status,
+            note: reg.note,
+          },
+        });
+      }
+
+      case "adminLogin": {
+        const token = adminLogin_(body.username, body.password);
+        if (!token) return jsonOut_({ ok: false, message: "ভুল ইউজারনেম বা পাসওয়ার্ড।" });
+        return jsonOut_({ ok: true, data: { token } });
+      }
+
+      case "adminListRegistrations": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const regRows = sheetToObjects_(getSheet_("Registrations"));
+        const trxCount = {};
+        const normTrx = (v) => String(v || "").trim().toUpperCase();
+        regRows.forEach((r) => {
+          const k = normTrx(r.transactionId);
+          if (k) trxCount[k] = (trxCount[k] || 0) + 1;
+        });
+        regRows.forEach((r) => {
+          const k = normTrx(r.transactionId);
+          r.duplicateTrx = !!k && trxCount[k] > 1;
+        });
+        return jsonOut_({ ok: true, data: regRows });
+      }
+
+      case "adminUpdateRegistrationStatus": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const sheet = getSheet_("Registrations");
+        const rowIdx = findRowIndexById_(sheet, body.id);
+        if (rowIdx === -1) return jsonOut_({ ok: false, message: "রেজিস্ট্রেশন পাওয়া যায়নি" });
+        const prevStatus = sheet.getRange(rowIdx, REGISTRATION_HEADERS.indexOf("status") + 1).getValue();
+        sheet.getRange(rowIdx, REGISTRATION_HEADERS.indexOf("status") + 1).setValue(body.status);
+        if (body.status === "confirmed" && prevStatus !== "confirmed") {
+          const regRow = findRegistrationById_(body.id);
+          if (regRow) notifyRegistrationConfirmed_(regRow);
+        }
+        return jsonOut_({ ok: true });
+      }
+
+      case "adminUpdateSettings": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        setSettingsObj_(body);
+        return jsonOut_({ ok: true });
+      }
+
+      /* ---------- স্টুডেন্ট লগইন ও পোর্টাল ---------- */
+
+      case "studentLogin": {
+        const result = studentLogin_(body.email, body.password);
+        if (!result) return jsonOut_({ ok: false, message: "ভুল ইমেইল বা পাসওয়ার্ড।" });
+        const headers = result.headers;
+        const row = result.row;
+        const get = (key) => row[headers.indexOf(key)];
+        return jsonOut_({
+          ok: true,
+          data: {
+            token: result.token,
+            profile: {
+              name: get("name"),
+              className: get("className"),
+              school: get("school"),
+              division: get("division"),
+              status: get("status"),
+            },
+          },
+        });
+      }
+
+      case "studentMe": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({
+          ok: true,
+          data: {
+            name: reg.name,
+            className: reg.className,
+            school: reg.school,
+            division: reg.division,
+            status: reg.status,
+          },
+        });
+      }
+
+      case "studentNotices": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: listActiveNotices_() });
+      }
+
+      /* ---------- অ্যাডমিন: নোটিশ ---------- */
+
+      case "adminAddNotice": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        if (!body.message) return jsonOut_({ ok: false, message: "নোটিশের লেখা দিন।" });
+        const id = addNotice_(body.message);
+        return jsonOut_({ ok: true, data: { id } });
+      }
+
+      case "adminListNotices": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: sheetToObjects_(getSheet_("Notices")) });
+      }
+
+      case "adminDeleteNotice": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const sheet = getSheet_("Notices");
+        const rowIdx = findRowIndexById_(sheet, body.id);
+        if (rowIdx === -1) return jsonOut_({ ok: false, message: "নোটিশ পাওয়া যায়নি" });
+        sheet.deleteRow(rowIdx);
+        return jsonOut_({ ok: true });
+      }
+
+      /* ---------- যোগাযোগ ফর্ম ---------- */
+
+      case "submitContact": {
+        if (!body.email || !body.message) return jsonOut_({ ok: false, message: "ইমেইল ও মেসেজ দিন।" });
+        const id = addContact_(body);
+        return jsonOut_({ ok: true, data: { id } });
+      }
+
+      case "adminListContacts": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const rows = sheetToObjects_(getSheet_("Contacts")).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        return jsonOut_({ ok: true, data: rows });
+      }
+
+      case "adminMarkContactDone": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const sheet = getSheet_("Contacts");
+        const rowIdx = findRowIndexById_(sheet, body.id);
+        if (rowIdx === -1) return jsonOut_({ ok: false, message: "পাওয়া যায়নি" });
+        sheet.getRange(rowIdx, CONTACT_HEADERS.indexOf("status") + 1).setValue(body.status || "done");
+        return jsonOut_({ ok: true });
+      }
+
+      /* ---------- লাইভ পরীক্ষার সময় ---------- */
+
+      case "liveExamStatus": {
+        let regId = "";
+        if (body.token) {
+          const reg = findRegistrationByStudentToken_(body.token);
+          if (reg) regId = reg.id;
+        }
+        return jsonOut_({ ok: true, data: { exams: liveExamsWithStatus_(regId) } });
+      }
+
+      /* ---------- স্টুডেন্ট: লিখিত পরীক্ষা ---------- */
+
+      /** মডেল টেস্টের তালিকা (প্রশ্ন ছাড়া) — টোকেন থাকলে স্টুডেন্টের নিজের অগ্রগতিসহ */
+      case "modelTests": {
+        let regId = "";
+        if (body.token) {
+          const reg = findRegistrationByStudentToken_(body.token);
+          if (reg) regId = reg.id;
+        }
+        return jsonOut_({ ok: true, data: listModelTests_(regId) });
+      }
+
+      case "startWrittenExam": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized — আবার লগইন করুন।" });
+        if (reg.status !== "confirmed") return jsonOut_({ ok: false, message: "আপনার রেজিস্ট্রেশন এখনও কনফার্ম হয়নি।" });
+        const examType = body.examType === "live" ? "live" : "mock";
+        let minutes = getWrittenMinutes_();
+        let liveExamId = "";
+        let title = "";
+        let sets = [];
+        if (examType === "live") {
+          const live = findLiveExam_(body.liveExamId);
+          if (!live) return jsonOut_({ ok: false, message: "এই লাইভ পরীক্ষাটি পাওয়া যায়নি।" });
+          const now = new Date();
+          if (now < new Date(live.start)) return jsonOut_({ ok: false, message: "\"" + live.title + "\" এখনো শুরু হয়নি।" });
+          if (now > new Date(live.end)) return jsonOut_({ ok: false, message: "\"" + live.title + "\"-এর সময় শেষ হয়ে গেছে।" });
+          if (participatedLiveExamIds_(reg.id).has(live.id)) {
+            return jsonOut_({ ok: false, message: "আপনি ইতিমধ্যে \"" + live.title + "\"-এ অংশ নিয়েছেন। একটা লাইভ পরীক্ষায় একবারই অংশ নেওয়া যায়।" });
+          }
+          minutes = live.minutes;
+          liveExamId = live.id;
+          title = live.title;
+          sets = getLiveSets_(live.id);
+        } else {
+          // মডেল টেস্ট: স্টুডেন্ট যেটা বেছেছে সেটার নির্দিষ্ট প্রশ্ন, প্রশ্নের নিজস্ব সময় অনুযায়ী
+          if (!body.modelTestId) return jsonOut_({ ok: false, message: "কোন মডেল টেস্ট দিতে চান তা বেছে নিন।" });
+          const test = publishedModelTests_().find((q) => String(q.id) === String(body.modelTestId));
+          if (!test) return jsonOut_({ ok: false, message: "এই মডেল টেস্টটি পাওয়া যায়নি বা এখনো প্রকাশ হয়নি।" });
+          minutes = test.minutes || minutes;
+          title = test.testTitle;
+          sets = [formatSet_(test)];
+        }
+        if (sets.length === 0 || sets.every((st) => (st.subQuestions || []).length === 0)) {
+          return jsonOut_({ ok: false, message: "এখনো কোনো প্রশ্ন প্রকাশ করা হয়নি। পরে আবার চেষ্টা করুন।" });
+        }
+        return jsonOut_({ ok: true, data: { sessionId: Utilities.getUuid(), sets, minutes, liveExamId, title } });
+      }
+
+      case "submitWrittenAnswer": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized — আবার লগইন করুন।" });
+        if (!body.imageBase64) return jsonOut_({ ok: false, message: "ছবি পাওয়া যায়নি।" });
+        if (body.examType === "live") {
+          if (!body.liveExamId) return jsonOut_({ ok: false, message: "লাইভ পরীক্ষার তথ্য পাওয়া যায়নি।" });
+          const priorSession = sheetToObjects_(getSheet_("WrittenAttempts")).find(
+            (a) =>
+              String(a.registrationId) === String(reg.id) &&
+              a.examType === "live" &&
+              String(a.liveExamId) === String(body.liveExamId) &&
+              String(a.sessionId) !== String(body.sessionId)
+          );
+          if (priorSession) return jsonOut_({ ok: false, message: "আপনি এই লাইভ পরীক্ষায় ইতিমধ্যে অংশ নিয়েছেন।" });
+        }
+        const imageUrl = uploadImageToDrive_(body.imageBase64, body.mimeType, "answer_" + Utilities.getUuid() + ".jpg");
+        const id = saveWrittenAttempt_({
+          registrationId: reg.id,
+          phone: reg.phone,
+          email: reg.email,
+          examType: body.examType || "mock",
+          kind: "written",
+          sessionId: body.sessionId,
+          writtenQuestionId: body.writtenQuestionId,
+          subQuestionId: body.subQuestionId,
+          subQuestionText: body.subQuestionText,
+          subQuestionImageUrl: body.subQuestionImageUrl,
+          liveExamId: body.liveExamId,
+          points: body.points,
+          imageUrl,
+        });
+        return jsonOut_({ ok: true, data: { id, imageUrl } });
+      }
+
+      /** একটা উদ্দীপকের সবগুলো প্রশ্নের উত্তর একটামাত্র ছবিতে — ছবি একবারই Drive-এ আপলোড হয়,
+       *  তারপর প্রতিটা প্রশ্নের জন্য আলাদা WrittenAttempts সারি তৈরি হয় (সবগুলো একই ছবির লিংক
+       *  শেয়ার করে), যাতে প্রতিটা প্রশ্ন আলাদাভাবে মূল্যায়ন করা যায়। */
+      case "submitWrittenAnswersBatch": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized — আবার লগইন করুন।" });
+        if (!body.imageBase64) return jsonOut_({ ok: false, message: "ছবি পাওয়া যায়নি।" });
+        if (!body.items || body.items.length === 0) return jsonOut_({ ok: false, message: "কোনো প্রশ্ন পাওয়া যায়নি।" });
+        if (body.examType === "live") {
+          if (!body.liveExamId) return jsonOut_({ ok: false, message: "লাইভ পরীক্ষার তথ্য পাওয়া যায়নি।" });
+          const priorSession = sheetToObjects_(getSheet_("WrittenAttempts")).find(
+            (a) =>
+              String(a.registrationId) === String(reg.id) &&
+              a.examType === "live" &&
+              String(a.liveExamId) === String(body.liveExamId) &&
+              String(a.sessionId) !== String(body.sessionId)
+          );
+          if (priorSession) return jsonOut_({ ok: false, message: "আপনি এই লাইভ পরীক্ষায় ইতিমধ্যে অংশ নিয়েছেন।" });
+        }
+        const imageUrl = uploadImageToDrive_(body.imageBase64, body.mimeType, "answer_" + Utilities.getUuid() + ".jpg");
+        const ids = body.items.map((item) =>
+          saveWrittenAttempt_({
+            registrationId: reg.id,
+            phone: reg.phone,
+            email: reg.email,
+            examType: body.examType || "mock",
+            kind: "written",
+            sessionId: body.sessionId,
+            writtenQuestionId: item.writtenQuestionId,
+            subQuestionId: item.subQuestionId,
+            subQuestionText: item.subQuestionText,
+            subQuestionImageUrl: item.subQuestionImageUrl,
+            liveExamId: body.liveExamId,
+            points: item.points,
+            imageUrl,
+          })
+        );
+        return jsonOut_({ ok: true, data: { ids, imageUrl } });
+      }
+
+      case "studentWrittenAttempts": {
+        const reg = findRegistrationByStudentToken_(body.token);
+        if (!reg) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: listWrittenAttemptsForStudent_(reg.id) });
+      }
+
+      case "leaderboard": {
+        const examType = body.examType === "live" ? "live" : "mock";
+        return jsonOut_({ ok: true, data: getLeaderboard_(examType, body.filterId) });
+      }
+
+      /* ---------- অ্যাডমিন: লিখিত প্রশ্ন ব্যাংক ---------- */
+
+      case "adminAddWrittenQuestion": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const invalid = validateWrittenQuestion_(body);
+        if (invalid) return jsonOut_({ ok: false, message: invalid });
+        const id = addWrittenQuestion_(body);
+        return jsonOut_({ ok: true, data: { id } });
+      }
+
+      case "adminUpdateWrittenQuestion": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        if (!body.id) return jsonOut_({ ok: false, message: "আইডি পাওয়া যায়নি" });
+        const invalidEdit = validateWrittenQuestion_(body);
+        if (invalidEdit) return jsonOut_({ ok: false, message: invalidEdit });
+        const okUpdated = updateWrittenQuestion_(body.id, body);
+        if (!okUpdated) return jsonOut_({ ok: false, message: "প্রশ্ন পাওয়া যায়নি" });
+        return jsonOut_({ ok: true });
+      }
+
+      case "adminListWrittenQuestions": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        ensureModelNumbers_();
+        return jsonOut_({ ok: true, data: parsedWrittenQuestions_() });
+      }
+
+      case "adminDeleteWrittenQuestion": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const sheet = getSheet_("WrittenQuestions");
+        const rowIdx = findRowIndexById_(sheet, body.id);
+        if (rowIdx === -1) return jsonOut_({ ok: false, message: "প্রশ্ন পাওয়া যায়নি" });
+        sheet.deleteRow(rowIdx);
+        return jsonOut_({ ok: true });
+      }
+
+      /* ---------- অ্যাডমিন: খাতা মূল্যায়ন ---------- */
+
+      case "adminStats": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: buildAdminStats_() });
+      }
+
+      case "adminResultsExport": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: buildResultsExport_() });
+      }
+
+      case "adminListPendingWritten": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: listPendingWrittenAttempts_() });
+      }
+
+      case "adminGradeWritten": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        let annotatedImageUrl = "";
+        if (body.annotatedImageBase64) {
+          annotatedImageUrl = uploadImageToDrive_(body.annotatedImageBase64, "image/jpeg", "graded_" + Utilities.getUuid() + ".jpg");
+        }
+        const okGraded = gradeWrittenAttempt_(body.id, body.score, annotatedImageUrl, body.adminComment);
+        if (!okGraded) return jsonOut_({ ok: false, message: "পাওয়া যায়নি" });
+        return jsonOut_({ ok: true });
+      }
+
+      case "adminGradeWrittenBatch": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        if (!body.items || body.items.length === 0) return jsonOut_({ ok: false, message: "কোনো আইটেম পাওয়া যায়নি" });
+        let annotatedImageUrl = "";
+        if (body.annotatedImageBase64) {
+          annotatedImageUrl = uploadImageToDrive_(body.annotatedImageBase64, "image/jpeg", "graded_" + Utilities.getUuid() + ".jpg");
+        }
+        const count = gradeWrittenAttemptsBatch_(body.items, annotatedImageUrl, body.adminComment);
+        notifyIfSessionGraded_(body.items.map((it) => it.id));
+        return jsonOut_({ ok: true, data: { count } });
+      }
+
+      /* ---------- অ্যাডমিন: লাইভ পরীক্ষা তৈরি/এডিট/মোছা ---------- */
+
+      case "adminListLiveExams": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: listLiveExams_() });
+      }
+
+      case "adminSaveLiveExam": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const start = toIso_(body.start);
+        const end = toIso_(body.end);
+        if (!start || !end) return jsonOut_({ ok: false, message: "শুরু ও শেষের তারিখ-সময় দিন।" });
+        if (new Date(end) <= new Date(start)) return jsonOut_({ ok: false, message: "শেষের সময় শুরুর সময়ের পরে হতে হবে।" });
+        const minutes = Math.round(Number(body.minutes));
+        if (!(minutes > 0)) return jsonOut_({ ok: false, message: "পরীক্ষার সময়কাল (মিনিট) দিন।" });
+        const title = String(body.title || "").trim() || "লাইভ পরীক্ষা";
+        const sheet = getSheet_("LiveExams");
+        if (body.id) {
+          const rowIdx = findRowIndexById_(sheet, body.id);
+          if (rowIdx === -1) return jsonOut_({ ok: false, message: "লাইভ পরীক্ষা পাওয়া যায়নি" });
+          const headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+          const col = (n) => headerRow.indexOf(n) + 1;
+          sheet.getRange(rowIdx, col("title")).setValue(title);
+          sheet.getRange(rowIdx, col("start")).setValue(start);
+          sheet.getRange(rowIdx, col("end")).setValue(end);
+          sheet.getRange(rowIdx, col("minutes")).setValue(minutes);
+          cacheDrop_(["liveExams_v1"]);
+          return jsonOut_({ ok: true, data: { id: body.id } });
+        }
+        const id = Utilities.getUuid();
+        appendRowByHeaders_(sheet, { id, title, start, end, minutes, createdAt: new Date() });
+        cacheDrop_(["liveExams_v1"]);
+        return jsonOut_({ ok: true, data: { id } });
+      }
+
+      case "adminDeleteLiveExam": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        const sheet = getSheet_("LiveExams");
+        const rowIdx = findRowIndexById_(sheet, body.id);
+        if (rowIdx === -1) return jsonOut_({ ok: false, message: "লাইভ পরীক্ষা পাওয়া যায়নি" });
+        sheet.deleteRow(rowIdx);
+        cacheDrop_(["liveExams_v1"]);
+        return jsonOut_({ ok: true });
+      }
+
+      /* ---------- অ্যাডমিন: লাইভ ফলাফল ---------- */
+
+      case "adminLiveResults": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        return jsonOut_({ ok: true, data: getLeaderboard_("live", body.liveExamId) });
+      }
+
+      /* ---------- অ্যাডমিন: অফলাইন প্রশ্নপত্র (PDF) ---------- */
+
+      case "adminGenerateOfflineWritten": {
+        if (!checkAdminToken_(body.token)) return jsonOut_({ ok: false, message: "Unauthorized" });
+        try {
+          return jsonOut_({ ok: true, data: buildOfflineWrittenPdf_(body.modelTestId) });
+        } catch (err) {
+          return jsonOut_({ ok: false, message: "PDF তৈরি করা যায়নি: " + String(err) });
+        }
+      }
+
+      default:
+        return jsonOut_({ ok: false, message: "অজানা action" });
+    }
+  } catch (err) {
+    return jsonOut_({ ok: false, message: String(err) });
+  }
+}
